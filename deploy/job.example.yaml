@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: open-webui-install-zen-billing
+  namespace: applications-and-services
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: install
+          image: ghcr.io/aetherrootr/open-webui-zen-billing:v0.1.0
+          env:
+            - name: WEBUI_INTERNAL_URL
+              value: http://open-webui:8080
+            - name: WEBUI_SECRET_KEY_FILE
+              value: /app/backend/data/.webui_secret_key
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-postgres-secret
+                  key: password
+            - name: DATABASE_URL
+              value: postgresql://open_webui:$(DATABASE_PASSWORD)@open-webui-postgres:5432/open_webui
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: '1', memory: 1Gi}
+          volumeMounts:
+            - name: data
+              mountPath: /app/backend/data
+              subPath: open-webui
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: service-data-applications-and-services-pvc
