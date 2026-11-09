@@ -21,6 +21,11 @@ class QueryTests(unittest.TestCase):
             '/prompt 上月': ('previous', None),
             '/prompt 2026-11': ('month', '2026-11'),
             '/zen-billing 2026-11': ('month', '2026-11'),
+            '查看累计费用': ('all', None),
+            '/prompt 总费用': ('all', None),
+            '最近30天': ('recent', 30),
+            '2026-11-01 至 2026-11-10': ('range', ('2026-11-01', '2026-11-10')),
+            '/prompt 2026-11-01 2026-11-10': ('range', ('2026-11-01', '2026-11-10')),
         }
         for query, expected in cases.items():
             with self.subTest(query=query):
@@ -40,6 +45,10 @@ class QueryTests(unittest.TestCase):
             '2026-1',
             '/prompt 2026-13',
             '乱写 2026-11 不要查询',
+            '2026-02-30 至 2026-03-01',
+            '2026-11-10 至 2026-11-01',
+            '最近0天',
+            '最近3661天',
         ]:
             with self.subTest(query=query):
                 self.assertEqual(report.parse_query(query), ('help', None))
@@ -108,3 +117,17 @@ class PipeTests(unittest.IsolatedAsyncioTestCase):
         result = await report.Pipe().pipe({'messages': []})
         self.assertEqual(result, '请先登录。')
         self.loader.assert_not_called()
+
+    async def test_all_time_query_keeps_identity(self):
+        await self.call('/prompt 总费用')
+        self.tracker.report.assert_awaited_once_with(self.user, all_time=True)
+
+    async def test_date_range_query_keeps_identity(self):
+        await self.call('2026-11-01 至 2026-11-10')
+        self.tracker.report.assert_awaited_once_with(self.user, start_date='2026-11-01', end_date='2026-11-10')
+
+    async def test_recent_days_include_today(self):
+        with patch.object(report, 'datetime') as clock:
+            clock.now.return_value = datetime(2026, 11, 10)
+            await self.call('最近7天')
+        self.tracker.report.assert_awaited_once_with(self.user, start_date='2026-11-04', end_date='2026-11-10')

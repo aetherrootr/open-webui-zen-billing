@@ -19,7 +19,7 @@ WebUI's native administration API. The functions then run inside Open WebUI:
 Users -> Open WebUI -> shared OpenCode Zen API
               |
               +-> Zen billing filter -> existing PostgreSQL ledger
-              +-> Zen reporting model -> per-user/month report
+              +-> Zen reporting model -> per-user cost reports
 ```
 
 - `zen_cost_tracker`: enabled globally; only processes supported Zen connections.
@@ -28,8 +28,8 @@ Users -> Open WebUI -> shared OpenCode Zen API
 
 ### Query entry points
 
-Selecting the report model shows starter suggestions for this month, last month
-and help. The installer also registers shared Workspace Prompts so typing `/`
+Selecting the report model shows starter suggestions for this month, last month,
+lifetime totals, the last 30 days and help. The installer also registers shared Workspace Prompts so typing `/`
 offers reusable query text. These prompts fill the input; they do not switch the
 selected model. Select **Zen 费用报表** before sending them.
 
@@ -37,13 +37,18 @@ selected model. Select **Zen 费用报表** before sending them.
 |---|---|
 | `查看本月费用`, `本月` | Current month |
 | `查看上月费用`, `上月` | Previous month, in the ledger timezone |
+| `查看累计费用`, `总费用` | All recorded history |
+| `最近7天`, `最近30天` | Recent calendar days, including today |
 | `2026-11`, `查看 2026-11 费用` | Specified month |
+| `2026-11-01 至 2026-11-10` | Date range, including both endpoints |
 | `/prompt 本月`, `/prompt 上月`, `/prompt 2026-11` | Explicit query command |
+| `/prompt 总费用`, `/prompt 2026-11-01 至 2026-11-10` | Lifetime or date-range query |
 | `/prompt`, `/zen-billing`, `help`, `帮助` | Query help |
-| Unrecognized input or an invalid month | Query help, without a ledger query |
+| Unrecognized input or an invalid period | Query help, without a ledger query |
 
 Shared prompts include `/prompt`, `/zen-billing` (help), `/zen-billing-month`
-(current month) and `/zen-billing-last-month` (previous month). If a command already
+(current month), `/zen-billing-last-month` (previous month), `/zen-billing-total`
+(all history) and `/zen-billing-last-30-days`. If a command already
 belongs to an unrelated user prompt, the installer leaves it untouched and logs
 the skipped command. The other commands and direct report queries still work.
 The installer preserves existing report-model settings/access and managed-prompt
@@ -56,6 +61,9 @@ estimated costs, and requests requiring reconciliation. Estimates use exact mode
 IDs from the Zen `/models` catalog, with separate input/output/cache rates and
 supported context tiers; unknown models and missing usage are not treated as free.
 Prices and totals use decimal arithmetic in USD.
+Each user summary includes the recorded total (reported plus estimated costs).
+Date ranges use the configured ledger timezone. Lifetime queries cover records
+registered by this plugin; they do not reconstruct usage before installation.
 
 ## Develop and test
 

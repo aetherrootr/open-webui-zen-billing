@@ -4,10 +4,12 @@ import copy
 import asyncio
 import json
 import unittest
+from datetime import datetime
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy import text
@@ -200,7 +202,7 @@ class LedgerTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_zen_request_is_ignored(self):
         self.filter.connection.return_value = None
         await self.record(self.user_a)
-        self.assertIn('本月暂无', await self.filter.report(self.user_a))
+        self.assertIn('暂无费用记录', await self.filter.report(self.user_a))
 
     async def test_merged_billed_cost_wins_over_per_call_estimates(self):
         body = copy.deepcopy(self.body)
@@ -385,6 +387,67 @@ class LedgerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata['zen_cost_calls']['message-1']['input_tokens'], 11)
         self.assertEqual(metadata['zen_cost_calls']['message-1']['output_tokens'], 4)
         self.assertIn('上游费用 $0.10000000', await self.filter.report(self.user_a))
+
+    async def record_at(self, user, date, amount, identifier):
+        stamp = int(datetime.fromisoformat(date).replace(tzinfo=ZoneInfo('Asia/Shanghai')).timestamp())
+        body = copy.deepcopy(self.body)
+        body['messages'][0]['usage']['cost'] = amount
+        await self.record(user, {'zen_cost_record': identifier, 'zen_cost_context': {'created_at': stamp}}, body)
+
+    async def dated_records(self):
+        await self.record_at(self.user_a, '2026-11-01T00:00:00', 1, 'first')
+        await self.record_at(self.user_a, '2026-11-10T23:59:59', 2, 'last')
+        await self.record_at(self.user_a, '2026-11-11T00:00:00', 4, 'outside')
+        await self.record_at(self.user_b, '2026-11-05T12:00:00', 8, 'bob')
+        await self.record_at(self.user_a, '2026-10-31T23:59:59', 16, 'previous')
+
+    async def test_inclusive_date_range_uses_ledger_timezone_and_user_scope(self):
+        await self.dated_records()
+        result = await self.filter.report(self.user_a, start_date='2026-11-01', end_date='2026-11-10')
+        self.assertIn('已记录总额 $3.00000000', result)
+        self.assertNotIn('Bob', result)
+        self.assertIn('含首尾两天', result)
+
+    async def test_admin_date_range_totals_all_users(self):
+        await self.dated_records()
+        result = await self.filter.report(
+            {'id': 'admin', 'role': 'admin'}, start_date='2026-11-01', end_date='2026-11-10'
+        )
+        self.assertIn('已记录总额 $11.00000000', result)
+        self.assertIn('| Alice | $3.00000000', result)
+        self.assertIn('| Bob | $8.00000000', result)
+
+    async def test_all_time_totals_preserve_user_isolation(self):
+        await self.dated_records()
+        result = await self.filter.report(self.user_a, all_time=True)
+        self.assertIn('历史累计', result)
+        self.assertIn('已记录总额 $23.00000000', result)
+        self.assertNotIn('Bob', result)
+        admin = await self.filter.report({'id': 'admin', 'role': 'admin'}, all_time=True)
+        self.assertIn('已记录总额 $31.00000000', admin)
+
+    async def test_single_day_and_leap_day(self):
+        await self.record_at(self.user_a, '2024-02-29T23:59:59', 1, 'leap')
+        await self.record_at(self.user_a, '2024-03-01T00:00:00', 2, 'after-leap')
+        result = await self.filter.report(self.user_a, start_date='2024-02-29', end_date='2024-02-29')
+        self.assertIn('已记录总额 $1.00000000', result)
+
+    async def test_invalid_or_ambiguous_ranges_are_rejected(self):
+        for args in [
+            dict(start_date='2026-11-01'),
+            dict(start_date='2026-11-10', end_date='2026-11-01'),
+            dict(start_date='2026-02-30', end_date='2026-03-01'),
+            dict(month='2026-11', all_time=True),
+        ]:
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                await self.filter.report(self.user_a, **args)
+
+    async def test_user_rename_does_not_split_lifetime_totals(self):
+        await self.record_at(self.user_a, '2026-10-01T00:00:00', 1, 'old-name')
+        await self.record_at({**self.user_a, 'name': 'Alice renamed'}, '2026-11-01T00:00:00', 2, 'new-name')
+        result = await self.filter.report(self.user_a, all_time=True)
+        self.assertIn('| Alice renamed | $3.00000000', result)
+        self.assertNotIn('| Alice |', result)
 
 
 if __name__ == '__main__':

@@ -2,13 +2,16 @@
   "suggestion_prompts": [
     {"title": ["查看本月费用", "按用户和模型汇总"], "content": "查看本月费用"},
     {"title": ["查看上月费用", "按账本时区查询"], "content": "查看上月费用"},
-    {"title": ["查询指定月份", "先查看命令用法"], "content": "/prompt"},
+    {"title": ["查看累计费用", "插件已登记的全部历史记录"], "content": "查看累计费用"},
+    {"title": ["最近30天费用", "包含今天"], "content": "最近30天"},
     {"title": ["查询帮助", "查看支持的查询方式"], "content": "帮助"}
   ],
   "prompts": [
     {"command": "/prompt", "name": "Zen 费用查询帮助", "content": "帮助"},
     {"command": "/zen-billing", "name": "Zen 费用查询帮助（备用入口）", "content": "帮助"},
     {"command": "/zen-billing-month", "name": "Zen 本月费用", "content": "查看本月费用"},
-    {"command": "/zen-billing-last-month", "name": "Zen 上月费用", "content": "查看上月费用"}
+    {"command": "/zen-billing-last-month", "name": "Zen 上月费用", "content": "查看上月费用"},
+    {"command": "/zen-billing-total", "name": "Zen 累计费用", "content": "查看累计费用"},
+    {"command": "/zen-billing-last-30-days", "name": "Zen 最近30天费用", "content": "最近30天"}
   ]
 }

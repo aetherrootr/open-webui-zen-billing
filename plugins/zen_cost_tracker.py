@@ -12,7 +12,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -513,62 +513,88 @@ class Filter:
             log.exception('Zen cost ledger write failed')
         return body
 
-    async def report(self, user, month=None):
+    async def report(self, user, month=None, *, start_date=None, end_date=None, all_time=False):
         zone = ZoneInfo(self.valves.timezone)
         now = datetime.now(zone)
-        year, mon = map(int, month.split('-')) if month else (now.year, now.month)
-        start = datetime(year, mon, 1, tzinfo=zone)
-        end = datetime(year + (mon == 12), 1 if mon == 12 else mon + 1, 1, tzinfo=zone)
-        query = 'SELECT user_id,user_name,model_id,amount,source,detail FROM zen_user_cost_entry WHERE created_at >= :start AND created_at < :end'
-        params = {'start': int(start.timestamp()), 'end': int(end.timestamp())}
+        if sum((bool(month), bool(start_date or end_date), bool(all_time))) > 1:
+            raise ValueError('查询范围只能选择一种')
+        params = {}
+        query = 'SELECT user_id,user_name,model_id,amount,source,detail FROM zen_user_cost_entry WHERE 1=1'
+        if all_time:
+            label = '历史累计'
+        else:
+            if start_date or end_date:
+                if not start_date or not end_date:
+                    raise ValueError('需要同时提供起止日期')
+                start = datetime.strptime(start_date, '%Y-%m-%d').replace(tzinfo=zone)
+                last = datetime.strptime(end_date, '%Y-%m-%d').replace(tzinfo=zone)
+                if last < start:
+                    raise ValueError('结束日期不能早于开始日期')
+                end = last + timedelta(days=1)
+                label = f'{start_date} 至 {end_date}（含首尾两天）'
+            else:
+                year, mon = map(int, month.split('-')) if month else (now.year, now.month)
+                start = datetime(year, mon, 1, tzinfo=zone)
+                end = datetime(year + (mon == 12), 1 if mon == 12 else mon + 1, 1, tzinfo=zone)
+                label = f'{year}-{mon:02d}'
+            query += ' AND created_at >= :start AND created_at < :end'
+            params.update({'start': int(start.timestamp()), 'end': int(end.timestamp())})
         if user.get('role') != 'admin':
             query += ' AND user_id = :user'
             params['user'] = user['id']
+        query += ' ORDER BY created_at'
+        groups = {}
+        names = {}
         async with await database() as db:
             await ensure_table(db)
-            rows = (await db.execute(text(query), params)).mappings().all()
+            rows = await db.stream(text(query), params)
+            try:
+                async for row in rows.mappings():
+                    names[row['user_id']] = row['user_name']
+                    key = (row['user_id'], row['model_id'])
+                    group = groups.setdefault(
+                        key, {'reported': Decimal(0), 'estimated': Decimal(0), 'unpriced': 0, 'count': 0}
+                    )
+                    group['count'] += 1
+                    if row['amount'] is None or json.loads(row['detail']).get('state', 'complete') != 'complete':
+                        group['unpriced'] += 1
+                    if row['amount'] is not None:
+                        group[row['source']] += Decimal(row['amount'])
+            finally:
+                await rows.close()
             await db.commit()
-        groups = {}
-        for row in rows:
-            key = (row['user_id'], row['user_name'], row['model_id'])
-            group = groups.setdefault(key, {'reported': Decimal(0), 'estimated': Decimal(0), 'unpriced': 0, 'count': 0})
-            group['count'] += 1
-            if row['amount'] is None or json.loads(row['detail']).get('state', 'complete') != 'complete':
-                group['unpriced'] += 1
-            if row['amount'] is not None:
-                group[row['source']] += Decimal(row['amount'])
 
         def clean(value):
             return str(value).replace('|', '\\|').replace('\n', ' ')
 
         lines = [
-            f'### Zen 用户费用 · {year}-{mon:02d}',
+            f'### Zen 用户费用 · {label}',
             f'币种 USD，时区 {self.valves.timezone}。管理员可见所有用户，普通用户仅可见本人。',
             '',
             '| 用户 | 模型 | 请求数 | 上游费用 | 估算费用 | 待核对 |',
             '|---|---|---:|---:|---:|---:|',
         ]
-        for (_, name, model_id), g in sorted(groups.items()):
+        for (uid, model_id), g in sorted(groups.items()):
             lines.append(
-                f'| {clean(name)} | {clean(model_id)} | {g["count"]} | ${g["reported"]:.8f} | ${g["estimated"]:.8f} | {g["unpriced"]} |'
+                f'| {clean(names[uid])} | {clean(model_id)} | {g["count"]} | ${g["reported"]:.8f} | ${g["estimated"]:.8f} | {g["unpriced"]} |'
             )
         reported = sum((g['reported'] for g in groups.values()), Decimal(0))
         estimated = sum((g['estimated'] for g in groups.values()), Decimal(0))
         users = {}
-        for (uid, name, _), group in groups.items():
-            totals = users.setdefault((uid, name), {'reported': Decimal(0), 'estimated': Decimal(0), 'unpriced': 0})
+        for (uid, _), group in groups.items():
+            totals = users.setdefault(uid, {'reported': Decimal(0), 'estimated': Decimal(0), 'unpriced': 0})
             for field in totals:
                 totals[field] += group[field]
-        lines += ['', '| 用户汇总 | 上游费用 | 估算费用 | 待核对 |', '|---|---:|---:|---:|']
-        for (_, name), total in sorted(users.items()):
+        lines += ['', '| 用户汇总 | 已记录总额 | 上游费用 | 其中估算 | 待核对 |', '|---|---:|---:|---:|---:|']
+        for uid, total in sorted(users.items()):
             lines.append(
-                f'| {clean(name)} | ${total["reported"]:.8f} | ${total["estimated"]:.8f} | {total["unpriced"]} |'
+                f'| {clean(names[uid])} | ${total["reported"] + total["estimated"]:.8f} | ${total["reported"]:.8f} | ${total["estimated"]:.8f} | {total["unpriced"]} |'
             )
         lines += [
             '',
-            f'**合计：上游费用 ${reported:.8f}；估算费用 ${estimated:.8f}；待核对 {sum(g["unpriced"] for g in groups.values())} 条。**',
+            f'**合计：已记录总额 ${reported + estimated:.8f}；上游费用 ${reported:.8f}；估算费用 ${estimated:.8f}；待核对 {sum(g["unpriced"] for g in groups.values())} 条。**',
             '登记请求不代表已扣费。待核对包含进行中或中断后缺少最终用量的请求；已观测金额会计入，仍可能有未知费用。估算费用不等同于 Zen 扣款账单。',
         ]
-        if not rows:
-            lines.append('本月暂无费用记录。')
+        if not groups:
+            lines.append('当前查询范围暂无费用记录。')
         return '\n'.join(lines)

@@ -126,7 +126,7 @@ class InstallerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('prompt', self.session.prompts)
         self.assertIn('zen-billing-month', self.session.prompts)
         model = self.session.models['zen_cost_report']
-        self.assertEqual(len(model['meta']['suggestion_prompts']), 4)
+        self.assertEqual(len(model['meta']['suggestion_prompts']), 5)
         self.assertEqual(model['access_grants'], install.PUBLIC_READ)
 
     async def test_does_not_overwrite_an_existing_prompt_command(self):
