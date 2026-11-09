@@ -26,6 +26,30 @@ Users -> Open WebUI -> shared OpenCode Zen API
 - `zen_cost_report`: select **Zen 费用报表** and send `查看本月费用` or `2026-11`.
   Admins see all users; regular users see only their own records.
 
+### Query entry points
+
+Selecting the report model shows starter suggestions for this month, last month
+and help. The installer also registers shared Workspace Prompts so typing `/`
+offers reusable query text. These prompts fill the input; they do not switch the
+selected model. Select **Zen 费用报表** before sending them.
+
+| Input | Result |
+|---|---|
+| `查看本月费用`, `本月` | Current month |
+| `查看上月费用`, `上月` | Previous month, in the ledger timezone |
+| `2026-11`, `查看 2026-11 费用` | Specified month |
+| `/prompt 本月`, `/prompt 上月`, `/prompt 2026-11` | Explicit query command |
+| `/prompt`, `/zen-billing`, `help`, `帮助` | Query help |
+| Unrecognized input or an invalid month | Query help, without a ledger query |
+
+Shared prompts include `/prompt`, `/zen-billing` (help), `/zen-billing-month`
+(current month) and `/zen-billing-last-month` (previous month). If a command already
+belongs to an unrelated user prompt, the installer leaves it untouched and logs
+the skipped command. The other commands and direct report queries still work.
+The installer preserves existing report-model settings/access and managed-prompt
+access when upgrading. All user scoping remains server-side; input cannot select
+another user's identity. Help and reports never call a paid model.
+
 Reported `usage.cost` takes precedence over catalog estimates. Explicitly marked
 provider estimates remain estimates. The report separates reported costs,
 estimated costs, and requests requiring reconciliation. Estimates use exact model
