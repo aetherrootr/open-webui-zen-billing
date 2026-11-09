@@ -131,16 +131,34 @@ Required runtime settings:
 
 ## Data and accounting scope
 
-Records are in `zen_user_cost_entry` in the existing Open WebUI database, covered
+Generation records are in `zen_user_cost_entry`; per-call checkpoints are in
+`zen_user_cost_call`. Both are in the existing Open WebUI database and covered
 by its database backup. They include user ID/name, model, timestamps, chat/message
 IDs, usage, cost source and price snapshots. No prompts, responses, authentication tokens or
 API keys are stored in the ledger. Chat deletion does not remove cost records.
 
-Tracking starts when the filter is enabled. Saved-chat completion flows are
-supported. This is usage attribution, **not an invoice, payment system or complete
-upstream billing reconciliation**: background title/tag generation, calls that
-bypass filters, bare API requests without completion context, personal Direct
-Connections and interrupted requests without a completion callback may be absent.
+Before a supported Zen request proceeds, the inlet/request hook commits a pending
+generation and an upstream-attempt record. Failure to register blocks dispatch.
+A pending record means a request was registered, not that the provider charged it.
+Streamed usage is checkpointed immediately when observed, without waiting for chat
+storage or a completion callback. Repeated cumulative frames replace their call's
+snapshot; tool rounds have separate attempts. Checkpoint writes are shielded from
+request cancellation and retained until finished while the process is alive.
+
+The completion hook reconciles the final aggregate amount instead of adding it to
+the checkpoints. A late frame cannot overwrite a completed generation. If no final
+callback arrives, reports retain observed amounts and flag the generation as
+pending reconciliation. Existing records from the earlier implementation need no
+schema rewrite; missing state metadata is treated as a legacy completed record.
+
+Tracking starts when the filter is enabled. This is usage attribution, **not an
+invoice, payment system or complete upstream billing reconciliation**: background
+title/tag generation, calls bypassing the inlet/request hooks and personal Direct
+Connections can be absent. Bare API requests without completion context may remain
+pending. If a provider never returns final usage, neither tokens nor an exact cost
+can be recovered from the client alone; a provider-side check is required. A pod
+crash can interrupt an uncommitted checkpoint, but the earlier pending row remains.
+The implementation never fabricates an exact charge for an unknown request.
 Merged tool-round estimates can differ from per-request context tiers. A one-hour
 cache write with no matching catalog rate is marked for reconciliation. The
 OpenCode statement remains authoritative. No historical backfill is performed.

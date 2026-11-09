@@ -151,6 +151,48 @@ async def ensure_table(db):
     await db.execute(
         text('CREATE INDEX IF NOT EXISTS zen_user_cost_time_user ON zen_user_cost_entry (created_at, user_id)')
     )
+    await db.execute(
+        text("""CREATE TABLE IF NOT EXISTS zen_user_cost_call (
+        attempt_id TEXT PRIMARY KEY, record_id TEXT NOT NULL, provider_id TEXT,
+        amount TEXT, source TEXT NOT NULL, detail TEXT NOT NULL
+    )""")
+    )
+    await db.execute(text('CREATE INDEX IF NOT EXISTS zen_cost_call_record ON zen_user_cost_call (record_id)'))
+
+
+def entry_values(context, amount=None, source='unpriced', detail=None):
+    return {
+        k: context.get(k)
+        for k in ('record_id', 'user_id', 'user_name', 'created_at', 'model_id', 'chat_id', 'message_id')
+    } | {
+        'amount': str(amount) if amount is not None else None,
+        'source': source,
+        'detail': json.dumps(detail or {'state': 'pending'}, ensure_ascii=False, default=str),
+    }
+
+
+async def lock_entry(db, values):
+    await ensure_table(db)
+    await db.execute(
+        text("""INSERT INTO zen_user_cost_entry
+        (record_id,user_id,user_name,created_at,model_id,chat_id,message_id,amount,source,detail)
+        VALUES (:record_id,:user_id,:user_name,:created_at,:model_id,:chat_id,:message_id,:amount,:source,:detail)
+        ON CONFLICT (record_id) DO NOTHING"""),
+        values,
+    )
+    # Serialize checkpoints and finalization for one generation on both PostgreSQL and SQLite.
+    result = await db.execute(
+        text("""UPDATE zen_user_cost_entry SET detail=detail
+        WHERE record_id=:record_id AND user_id=:user_id"""),
+        values,
+    )
+    if not result.rowcount:
+        raise ValueError('计费记录身份不匹配')
+    return (
+        (await db.execute(text('SELECT * FROM zen_user_cost_entry WHERE record_id=:record_id'), values))
+        .mappings()
+        .one()
+    )
 
 
 class Filter:
@@ -164,6 +206,110 @@ class Filter:
         self.valves = self.Valves()
         self._catalogs = {}
         self._lock = asyncio.Lock()
+        self._writes = set()
+
+    async def durable(self, operation):
+        task = asyncio.create_task(operation)
+        self._writes.add(task)
+
+        def finished(done):
+            self._writes.discard(done)
+            if not done.cancelled() and done.exception():
+                log.error('Zen cost checkpoint failed: %s', type(done.exception()).__name__)
+
+        task.add_done_callback(finished)
+        return await asyncio.shield(task)
+
+    async def begin_attempt(self, context, attempt):
+        async with await database() as db:
+            await lock_entry(db, entry_values(context))
+            await db.execute(
+                text("""INSERT INTO zen_user_cost_call
+                (attempt_id,record_id,provider_id,amount,source,detail)
+                VALUES (:attempt,:record,NULL,NULL,'unpriced','{}')
+                ON CONFLICT (attempt_id) DO NOTHING"""),
+                {'attempt': attempt, 'record': context['record_id']},
+            )
+            await db.commit()
+
+    async def checkpoint(self, context, attempt, provider_id, usage):
+        cached = self._catalogs.get(context['url'], {})
+        model = cached.get('models', {}).get(context['model_id'])
+        detail = {'usage': usage}
+        amount, source = None, 'unpriced'
+        try:
+            amount, source, calculation = calculate(usage, model)
+            detail['calculation'] = calculation
+        except (ValueError, TypeError, KeyError) as exc:
+            detail['error'] = str(exc)
+        async with await database() as db:
+            current = await lock_entry(db, entry_values(context))
+            await db.execute(
+                text("""INSERT INTO zen_user_cost_call
+                (attempt_id,record_id,provider_id,amount,source,detail)
+                VALUES (:attempt,:record,:provider,:amount,:source,:detail)
+                ON CONFLICT (attempt_id) DO UPDATE SET
+                provider_id=excluded.provider_id, amount=excluded.amount, source=excluded.source, detail=excluded.detail"""),
+                {
+                    'attempt': attempt,
+                    'record': context['record_id'],
+                    'provider': provider_id,
+                    'amount': str(amount) if amount is not None else None,
+                    'source': source,
+                    'detail': json.dumps(detail, ensure_ascii=False, default=str),
+                },
+            )
+            root_detail = json.loads(current['detail'])
+            if root_detail.get('state') != 'complete':
+                calls = (
+                    (
+                        await db.execute(
+                            text('SELECT amount,source FROM zen_user_cost_call WHERE record_id=:record'),
+                            {'record': context['record_id']},
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                known = [c for c in calls if c['amount'] is not None]
+                total = sum((Decimal(c['amount']) for c in known), Decimal(0)) if known else None
+                source = (
+                    ('reported' if all(c['source'] == 'reported' for c in known) else 'estimated')
+                    if known
+                    else 'unpriced'
+                )
+                root_detail.update(
+                    {
+                        'state': 'observed',
+                        'observed_calls': len(known),
+                        'pending_calls': len(calls) - len(known),
+                        'currency': 'USD',
+                    }
+                )
+                await db.execute(
+                    text("""UPDATE zen_user_cost_entry SET amount=:amount,source=:source,detail=:detail
+                    WHERE record_id=:record"""),
+                    {
+                        'record': context['record_id'],
+                        'amount': str(total) if total is not None else None,
+                        'source': source,
+                        'detail': json.dumps(root_detail, ensure_ascii=False),
+                    },
+                )
+            await db.commit()
+
+    async def finalize(self, values):
+        async with await database() as db:
+            current = await lock_entry(db, values)
+            if json.loads(current['detail']).get('state') != 'complete':
+                if values['amount'] is None and current['amount'] is not None:
+                    values = {**values, 'amount': current['amount'], 'source': current['source']}
+                await db.execute(
+                    text("""UPDATE zen_user_cost_entry SET amount=:amount,source=:source,detail=:detail
+                    WHERE record_id=:record_id AND user_id=:user_id"""),
+                    values,
+                )
+            await db.commit()
 
     async def connection(self, model, request):
         if request is None or not isinstance(model, dict):
@@ -211,24 +357,78 @@ class Filter:
                     return cached
                 raise ValueError('无法获取 Zen 官方价格目录') from None
 
-    async def inlet(self, body, __metadata__=None, __model__=None, __request__=None):
+    async def inlet(self, body, __metadata__=None, __model__=None, __request__=None, __user__=None):
         connection = await self.connection(__model__, __request__)
-        if connection and __metadata__ is not None:
-            __metadata__['zen_cost_record'] = str(uuid.uuid4())
+        if connection:
+            if __metadata__ is None or not (__user__ or {}).get('id'):
+                raise RuntimeError('Zen 计费请求缺少用户身份或请求上下文，已阻止调用')
+            record = str(uuid.uuid4())
+            __metadata__['zen_cost_record'] = record
             __metadata__['zen_cost_calls'] = {}
+            __metadata__['zen_cost_attempts'] = {}
+            __metadata__['zen_cost_active_attempt'] = str(uuid.uuid4())
+            __metadata__.pop('zen_cost_active_provider', None)
+            __metadata__['zen_cost_seen_event'] = False
+            __metadata__['zen_cost_request_seen'] = False
+            context = {
+                'record_id': record,
+                'user_id': __user__['id'],
+                'user_name': __user__.get('name', __user__['id']),
+                'created_at': int(time.time()),
+                'model_id': connection[2],
+                'url': connection[0],
+                'chat_id': __metadata__.get('chat_id') or body.get('chat_id'),
+                'message_id': __metadata__.get('message_id') or body.get('id'),
+            }
+            __metadata__['zen_cost_context'] = context
+            try:
+                await self.durable(self.begin_attempt(context, __metadata__['zen_cost_active_attempt']))
+            except Exception:
+                raise RuntimeError('无法登记 Zen 计费请求，已阻止调用，请稍后重试') from None
         return body
 
-    async def request(self, body, __model__=None, __request__=None):
-        if body.get('stream') and await self.connection(__model__, __request__):
-            body['stream_options'] = {**(body.get('stream_options') or {}), 'include_usage': True}
+    async def request(self, body, __model__=None, __request__=None, __metadata__=None, __user__=None):
+        if await self.connection(__model__, __request__):
+            if __metadata__ is None or 'zen_cost_context' not in __metadata__:
+                await self.inlet(body, __metadata__, __model__, __request__, __user__)
+            if __metadata__['zen_cost_request_seen'] or __metadata__['zen_cost_seen_event']:
+                __metadata__['zen_cost_active_attempt'] = str(uuid.uuid4())
+                __metadata__.pop('zen_cost_active_provider', None)
+                __metadata__['zen_cost_seen_event'] = False
+                try:
+                    await self.durable(
+                        self.begin_attempt(__metadata__['zen_cost_context'], __metadata__['zen_cost_active_attempt'])
+                    )
+                except Exception:
+                    raise RuntimeError('无法登记 Zen 计费请求，已阻止调用，请稍后重试') from None
+            __metadata__['zen_cost_request_seen'] = True
+            if body.get('stream'):
+                body['stream_options'] = {**(body.get('stream_options') or {}), 'include_usage': True}
         return body
 
     async def stream(self, event, __metadata__=None):
         if __metadata__ is None or 'zen_cost_calls' not in __metadata__:
             return event
-        payload = event.get('response') if event.get('type') == 'response.completed' else event
-        if isinstance(payload, dict) and payload.get('id') and payload.get('usage'):
-            __metadata__['zen_cost_calls'][payload['id']] = copy.deepcopy(payload['usage'])
+        __metadata__['zen_cost_seen_event'] = True
+        payload = event.get('response') if isinstance(event.get('response'), dict) else event
+        if event.get('type') == 'message_start' and isinstance(event.get('message'), dict):
+            payload = event['message']
+        provider = (
+            payload.get('id')
+            or __metadata__.get('zen_cost_active_provider')
+            or __metadata__.get('zen_cost_active_attempt')
+        )
+        if payload.get('id'):
+            __metadata__['zen_cost_active_provider'] = payload['id']
+        if isinstance(payload, dict) and provider and isinstance(payload.get('usage'), dict) and payload['usage']:
+            usage = {**__metadata__['zen_cost_calls'].get(provider, {}), **copy.deepcopy(payload['usage'])}
+            __metadata__['zen_cost_calls'][provider] = usage
+            context = __metadata__.get('zen_cost_context')
+            if context:
+                attempt = __metadata__['zen_cost_attempts'].setdefault(
+                    provider, __metadata__['zen_cost_active_attempt']
+                )
+                await self.durable(self.checkpoint(context, attempt, provider, usage))
         return event
 
     async def outlet(
@@ -285,6 +485,7 @@ class Filter:
                 detail['note'] = '按合并用量估算，工具多轮的阶梯价格可能有差异'
         except (ValueError, KeyError, TypeError) as exc:
             detail['error'] = str(exc)
+        detail['state'] = 'complete' if amount is not None else 'unresolved'
         record_id = metadata.get('zen_cost_record') or ':'.join(
             [user['id'], str(body.get('chat_id')), str(body.get('id') or message.get('id'))]
         )
@@ -292,7 +493,7 @@ class Filter:
             record_id=record_id,
             user_id=user['id'],
             user_name=user.get('name', user['id']),
-            created_at=int(time.time()),
+            created_at=(metadata.get('zen_cost_context') or {}).get('created_at', int(time.time())),
             model_id=model_id,
             chat_id=body.get('chat_id'),
             message_id=body.get('id') or message.get('id'),
@@ -301,16 +502,7 @@ class Filter:
             detail=json.dumps(detail, ensure_ascii=False, default=str),
         )
         try:
-            async with await database() as db:
-                await ensure_table(db)
-                await db.execute(
-                    text("""INSERT INTO zen_user_cost_entry
-                    (record_id,user_id,user_name,created_at,model_id,chat_id,message_id,amount,source,detail)
-                    VALUES (:record_id,:user_id,:user_name,:created_at,:model_id,:chat_id,:message_id,:amount,:source,:detail)
-                    ON CONFLICT (record_id) DO NOTHING"""),
-                    values,
-                )
-                await db.commit()
+            await self.durable(self.finalize(values))
             if __event_emitter__ and self.valves.show_status:
                 label = {'reported': '上游费用', 'estimated': '估算费用', 'unpriced': '费用待核对'}[source]
                 value = f'${amount:.8f}' if amount is not None else detail.get('error', '')
@@ -327,7 +519,7 @@ class Filter:
         year, mon = map(int, month.split('-')) if month else (now.year, now.month)
         start = datetime(year, mon, 1, tzinfo=zone)
         end = datetime(year + (mon == 12), 1 if mon == 12 else mon + 1, 1, tzinfo=zone)
-        query = 'SELECT user_id,user_name,model_id,amount,source FROM zen_user_cost_entry WHERE created_at >= :start AND created_at < :end'
+        query = 'SELECT user_id,user_name,model_id,amount,source,detail FROM zen_user_cost_entry WHERE created_at >= :start AND created_at < :end'
         params = {'start': int(start.timestamp()), 'end': int(end.timestamp())}
         if user.get('role') != 'admin':
             query += ' AND user_id = :user'
@@ -341,9 +533,9 @@ class Filter:
             key = (row['user_id'], row['user_name'], row['model_id'])
             group = groups.setdefault(key, {'reported': Decimal(0), 'estimated': Decimal(0), 'unpriced': 0, 'count': 0})
             group['count'] += 1
-            if row['amount'] is None:
+            if row['amount'] is None or json.loads(row['detail']).get('state', 'complete') != 'complete':
                 group['unpriced'] += 1
-            else:
+            if row['amount'] is not None:
                 group[row['source']] += Decimal(row['amount'])
 
         def clean(value):
@@ -353,7 +545,7 @@ class Filter:
             f'### Zen 用户费用 · {year}-{mon:02d}',
             f'币种 USD，时区 {self.valves.timezone}。管理员可见所有用户，普通用户仅可见本人。',
             '',
-            '| 用户 | 模型 | 回复数 | 上游费用 | 估算费用 | 待核对 |',
+            '| 用户 | 模型 | 请求数 | 上游费用 | 估算费用 | 待核对 |',
             '|---|---|---:|---:|---:|---:|',
         ]
         for (_, name, model_id), g in sorted(groups.items()):
@@ -375,7 +567,7 @@ class Filter:
         lines += [
             '',
             f'**合计：上游费用 ${reported:.8f}；估算费用 ${estimated:.8f}；待核对 {sum(g["unpriced"] for g in groups.values())} 条。**',
-            '仅统计插件启用后、通过共享 Zen 连接完成且进入回复完成钩子的请求。估算费用不等同于 Zen 扣款账单；缺失用量不会按零费用处理。',
+            '登记请求不代表已扣费。待核对包含进行中或中断后缺少最终用量的请求；已观测金额会计入，仍可能有未知费用。估算费用不等同于 Zen 扣款账单。',
         ]
         if not rows:
             lines.append('本月暂无费用记录。')

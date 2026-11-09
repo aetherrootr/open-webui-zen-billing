@@ -1,6 +1,7 @@
 """Run with the application's Python dependencies, never the production ledger."""
 
 import copy
+import asyncio
 import json
 import unittest
 from contextlib import asynccontextmanager
@@ -9,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy import text
 
 import zen_cost_tracker as tracker
 
@@ -224,6 +226,165 @@ class LedgerTests(unittest.IsolatedAsyncioTestCase):
         calls = {str(i): {'prompt_tokens': 80000, 'completion_tokens': 1000} for i in range(2)}
         await self.record(self.user_a, {'zen_cost_calls': calls}, body)
         self.assertIn('$0.01700000', await self.filter.report(self.user_a))
+
+    async def start_request(self):
+        metadata = {'chat_id': 'deleted-later', 'message_id': 'reply'}
+        await self.filter.inlet({}, __metadata__=metadata, __user__=self.user_a)
+        return metadata
+
+    async def stream_cost(self, metadata, provider='call-1', cost=0.1):
+        return await self.filter.stream(
+            {
+                'id': provider,
+                'usage': {
+                    'prompt_tokens': 11,
+                    'completion_tokens': 4,
+                    'cost': cost,
+                },
+            },
+            __metadata__=metadata,
+        )
+
+    async def test_request_is_durable_before_upstream_usage_exists(self):
+        metadata = await self.start_request()
+        async with await tracker.database() as db:
+            row = (await db.execute(text('SELECT amount,detail FROM zen_user_cost_entry'))).mappings().one()
+        self.assertIsNone(row['amount'])
+        self.assertEqual(json.loads(row['detail'])['state'], 'pending')
+        self.assertIn('待核对 1 条', await self.filter.report(self.user_a))
+        self.assertNotIn('not-a-real-key', json.dumps(metadata))
+
+    async def test_stream_amount_survives_missing_chat_and_outlet(self):
+        metadata = await self.start_request()
+        await self.stream_cost(metadata)
+        # No chat table is present and no completion callback is run.
+        result = await self.filter.report(self.user_a)
+        self.assertIn('上游费用 $0.10000000', result)
+        self.assertIn('待核对 1 条', result)
+        self.assertNotIn('Alice', await self.filter.report(self.user_b))
+
+    async def test_duplicate_usage_frames_do_not_duplicate_persisted_amount(self):
+        metadata = await self.start_request()
+        await self.stream_cost(metadata)
+        await self.stream_cost(metadata)
+        async with await tracker.database() as db:
+            self.assertEqual((await db.execute(text('SELECT count(*) FROM zen_user_cost_call'))).scalar(), 1)
+        result = await self.filter.report(self.user_a)
+        self.assertIn('上游费用 $0.10000000', result)
+        self.assertNotIn('$0.20000000', result)
+
+    async def test_tool_rounds_are_checkpoints_not_additional_completed_replies(self):
+        metadata = await self.start_request()
+        await self.stream_cost(metadata)
+        await self.filter.request({'stream': True}, __metadata__=metadata, __user__=self.user_a)
+        await self.stream_cost(metadata, 'call-2', 0.2)
+        result = await self.filter.report(self.user_a)
+        self.assertIn('上游费用 $0.30000000', result)
+        body = copy.deepcopy(self.body)
+        body['messages'][0]['usage']['cost'] = 0.3
+        await self.record(self.user_a, metadata, body)
+        result = await self.filter.report(self.user_a)
+        self.assertIn('上游费用 $0.30000000', result)
+        self.assertIn('待核对 0 条', result)
+        self.assertNotIn('$0.60000000', result)
+
+    async def test_unknown_later_round_keeps_known_cost_and_pending_marker(self):
+        metadata = await self.start_request()
+        await self.stream_cost(metadata)
+        await self.filter.request({'stream': True}, __metadata__=metadata, __user__=self.user_a)
+        body = copy.deepcopy(self.body)
+        body['messages'][0]['usage'] = {'incomplete': True}
+        await self.record(self.user_a, metadata, body)
+        result = await self.filter.report(self.user_a)
+        self.assertIn('上游费用 $0.10000000', result)
+        self.assertIn('待核对 1 条', result)
+
+    async def test_cancelled_stream_wait_does_not_cancel_its_database_checkpoint(self):
+        metadata = await self.start_request()
+        started, proceed = asyncio.Event(), asyncio.Event()
+        original = self.filter.checkpoint
+
+        async def delayed(*args):
+            started.set()
+            await proceed.wait()
+            await original(*args)
+
+        with patch.object(self.filter, 'checkpoint', delayed):
+            outer = asyncio.create_task(self.stream_cost(metadata))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            outer.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await outer
+            proceed.set()
+            await asyncio.wait_for(asyncio.gather(*self.filter._writes), timeout=2)
+        self.assertIn('上游费用 $0.10000000', await self.filter.report(self.user_a))
+
+    async def test_pending_request_survives_new_filter_instance(self):
+        await self.start_request()
+        fresh = tracker.Filter()
+        self.assertIn('待核对 1 条', await fresh.report(self.user_a))
+
+    async def test_database_failure_blocks_the_request_before_upstream_dispatch(self):
+        with patch.object(self.filter, 'begin_attempt', AsyncMock(side_effect=OSError('offline'))):
+            with self.assertRaisesRegex(RuntimeError, '已阻止调用'):
+                await self.start_request()
+
+    async def test_late_stream_frame_cannot_overwrite_final_reconciled_amount(self):
+        metadata = await self.start_request()
+        await self.stream_cost(metadata)
+        body = copy.deepcopy(self.body)
+        body['messages'][0]['usage']['cost'] = 0.3
+        await self.record(self.user_a, metadata, body)
+        await self.stream_cost(metadata, cost=0.9)
+        result = await self.filter.report(self.user_a)
+        self.assertIn('上游费用 $0.30000000', result)
+        self.assertIn('待核对 0 条', result)
+
+    async def test_first_request_hook_reuses_the_inlet_attempt(self):
+        metadata = await self.start_request()
+        await self.filter.request({'stream': True}, __metadata__=metadata, __user__=self.user_a)
+        async with await tracker.database() as db:
+            self.assertEqual((await db.execute(text('SELECT count(*) FROM zen_user_cost_call'))).scalar(), 1)
+
+    async def test_incomplete_responses_event_keeps_its_observed_cost(self):
+        metadata = await self.start_request()
+        await self.filter.stream(
+            {
+                'type': 'response.incomplete',
+                'response': {
+                    'id': 'response-1',
+                    'usage': {'input_tokens': 11, 'output_tokens': 4, 'cost': 0.1},
+                },
+            },
+            __metadata__=metadata,
+        )
+        result = await self.filter.report(self.user_a)
+        self.assertIn('上游费用 $0.10000000', result)
+        self.assertIn('待核对 1 条', result)
+
+    async def test_usage_without_provider_id_still_creates_checkpoint(self):
+        metadata = await self.start_request()
+        await self.filter.stream({'usage': {'cost': 0.1}}, __metadata__=metadata)
+        self.assertIn('上游费用 $0.10000000', await self.filter.report(self.user_a))
+
+    async def test_anthropic_partial_usage_is_merged_for_the_same_call(self):
+        metadata = await self.start_request()
+        await self.filter.stream(
+            {
+                'type': 'message_start',
+                'message': {
+                    'id': 'message-1',
+                    'usage': {'input_tokens': 11},
+                },
+            },
+            __metadata__=metadata,
+        )
+        await self.filter.stream(
+            {'type': 'message_delta', 'usage': {'output_tokens': 4, 'cost': 0.1}}, __metadata__=metadata
+        )
+        self.assertEqual(metadata['zen_cost_calls']['message-1']['input_tokens'], 11)
+        self.assertEqual(metadata['zen_cost_calls']['message-1']['output_tokens'], 4)
+        self.assertIn('上游费用 $0.10000000', await self.filter.report(self.user_a))
 
 
 if __name__ == '__main__':
